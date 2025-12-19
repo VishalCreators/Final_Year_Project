@@ -10,7 +10,7 @@
 #define BUF_SIZE 1024
 #define LOG_FILE "node_data_log.txt"
 
-#define NODE_ID 2          // 🔴 change for each client
+#define NODE_ID 3          // 🔴 change for each client
 #define SEND_INTERVAL 10000
 
 int main() {
