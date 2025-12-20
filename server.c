@@ -3,105 +3,185 @@
 #include <string.h>
 #include <winsock2.h>
 #include <windows.h>
+#include <time.h>
 
 #pragma comment(lib,"ws2_32.lib")
 
 #define SERVER_PORT 8888
 #define BUFFER_SIZE 1024
-#define MAX_NODES 5
+#define MAX_CLIENTS 10
 
-typedef struct{
+typedef struct {
+    struct sockaddr_in addr;
+    int registered;
     int nodeId;
-    FILE *file;
-} NodeSession;
+} Client;
 
-NodeSession sessions[MAX_NODES];
-SOCKET serverSocket;
+Client clients[MAX_CLIENTS];
+int clientCount = 0;
+CRITICAL_SECTION cs;
 
-/* ---------- Get or Create Node File ---------- */
-FILE* getNodeFile(int nodeId){
-    for(int i = 0; i < MAX_NODES; i++){
-        if(sessions[i].nodeId == nodeId)
-            return sessions[i].file;
-    }
-
-    for(int i = 0; i < MAX_NODES; i++){
-        if(sessions[i].nodeId == 0){
-            sessions[i].nodeId = nodeId;
-
-            char filename[100];
-            sprintf(filename, "server_storage/node_%d.txt", nodeId);
-
-            sessions[i].file = fopen(filename, "a");
-            return sessions[i].file;
-        }
-    }
-    return NULL;
+/* ---------- GET TIMESTAMP ---------- */
+void getTimestamp(char *timeBuf, int size) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    strftime(timeBuf, size, "%Y-%m-%d %H:%M:%S", t);
 }
 
-int main(){
-    WSADATA wsa;
-    struct sockaddr_in serverAddr, clientAddr;
-    char buffer[BUFFER_SIZE];
-    int currentNode = -1;
+/* ---------- LOG TO FILE (Structured) ---------- */
+void logToFile(int nodeId, const char *eventType, const char *data) {
+    FILE *fp = fopen("server_log.txt", "a");  // structured file
+    if (!fp) return;
 
-    printf("Starting server...\n");
-    WSAStartup(MAKEWORD(2,2), &wsa);
+    char timeBuf[64];
+    getTimestamp(timeBuf, sizeof(timeBuf));
 
-    serverSocket = socket(AF_INET, SOCK_DGRAM, 0);
-    if(serverSocket == INVALID_SOCKET){
-        printf("Socket creation failed\n");
-        return 1;
+    if (nodeId > 0)
+        fprintf(fp, "[%s] Node%d %s -> %s\n", timeBuf, nodeId, eventType, data);
+    else
+        fprintf(fp, "[%s] %s -> %s\n", timeBuf, eventType, data);
+
+    fclose(fp);
+}
+
+/* ---------- FIND NODE ID BY ADDR ---------- */
+int getNodeIdByAddr(struct sockaddr_in *addr) {
+    for (int i = 0; i < clientCount; i++) {
+        if (clients[i].registered &&
+            clients[i].addr.sin_addr.s_addr == addr->sin_addr.s_addr &&
+            clients[i].addr.sin_port == addr->sin_port) {
+            return clients[i].nodeId;
+        }
+    }
+    return -1; // unknown
+}
+
+/* ---------- REGISTER CLIENT ---------- */
+void registerClient(struct sockaddr_in *addr, int nodeId) {
+    EnterCriticalSection(&cs);
+
+    for (int i = 0; i < clientCount; i++) {
+        if (clients[i].nodeId == nodeId) {
+            LeaveCriticalSection(&cs);
+            return;
+        }
     }
 
-    BOOL reuse = TRUE;
-    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR,
-               (char*)&reuse, sizeof(reuse));
+    if (clientCount < MAX_CLIENTS) {
+        clients[clientCount].addr = *addr;
+        clients[clientCount].nodeId = nodeId;
+        clients[clientCount].registered = 1;
+        clientCount++;
+    }
+
+    LeaveCriticalSection(&cs);
+}
+
+/* ================= MAIN ================= */
+int main() {
+    WSADATA wsa;
+    SOCKET serverSocket;
+    struct sockaddr_in serverAddr, clientAddr;
+    char buffer[BUFFER_SIZE];
+    int addrLen = sizeof(clientAddr);
+
+    InitializeCriticalSection(&cs);
+
+    WSAStartup(MAKEWORD(2,2), &wsa);
+    serverSocket = socket(AF_INET, SOCK_DGRAM, 0);
 
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(SERVER_PORT);
     serverAddr.sin_addr.s_addr = INADDR_ANY;
 
-    if(bind(serverSocket, (struct sockaddr*)&serverAddr,
-            sizeof(serverAddr)) < 0){
-        printf("Bind failed. Error: %d\n", WSAGetLastError());
-        return 1;
-    }
+    bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
 
-    CreateDirectoryA("server_storage", NULL);
+    printf("✅ Server running on port %d\n", SERVER_PORT);
 
-    printf("Flood Detection Server running on UDP port %d\n\n",
-           SERVER_PORT);
+    while (1) {
+        int bytes = recvfrom(
+            serverSocket,
+            buffer,
+            BUFFER_SIZE - 1,
+            0,
+            (struct sockaddr*)&clientAddr,
+            &addrLen
+        );
 
-    while(1){
-        int len = sizeof(clientAddr);
-        int recvLen = recvfrom(serverSocket, buffer,
-                               BUFFER_SIZE-1, 0,
-                               (struct sockaddr*)&clientAddr, &len);
+        if (bytes <= 0)
+            continue;
 
-        if(recvLen <= 0) continue;
+        buffer[bytes] = '\0';
 
-        buffer[recvLen] = '\0';
-        printf("Received: %s\n", buffer);
+        char timeBuf[64];
+        getTimestamp(timeBuf, sizeof(timeBuf));
 
-        if(strncmp(buffer, "NODE:", 5) == 0){
-            currentNode = atoi(buffer + 5);
-            printf("Receiving from Node %d\n", currentNode);
-        }
-        else if(strncmp(buffer, "DATA:", 5) == 0 && currentNode != -1){
-            FILE *f = getNodeFile(currentNode);
-            if(f){
-                fprintf(f, "%s", buffer + 5);
-                fflush(f);
+        /* ---------- NODE ID MESSAGE (Auto-register) ---------- */
+        if (strncmp(buffer, "NODE:", 5) == 0) {
+            int nodeId = 0;
+            sscanf(buffer, "NODE:%d", &nodeId);
+
+            int existingId = getNodeIdByAddr(&clientAddr);
+            if (existingId == -1 && nodeId > 0) {
+                registerClient(&clientAddr, nodeId);
+                printf("[%s] 🟢 Node %d auto-registered\n", timeBuf, nodeId);
+                logToFile(nodeId, "REGISTER", "Auto-registered via NODE message");
             }
+            continue; // skip further processing for this message
         }
-        else if(strcmp(buffer, "EOF") == 0){
-            printf("Node %d transmission completed\n\n", currentNode);
-            currentNode = -1;
+
+        /* ---------- REGISTER ---------- */
+        if (strncmp(buffer, "REGISTER", 8) == 0) {
+            int nodeId;
+            sscanf(buffer, "REGISTER:NODE:%d", &nodeId);
+            registerClient(&clientAddr, nodeId);
+
+            printf("[%s] 🟢 Node %d registered\n", timeBuf, nodeId);
+            logToFile(nodeId, "REGISTER", "Node registered successfully");
+        }
+
+        /* ---------- DATA ---------- */
+        else if (strncmp(buffer, "DATA:", 5) == 0) {
+            int nodeId = getNodeIdByAddr(&clientAddr);
+            if (nodeId == -1) nodeId = 0; // fallback unknown
+
+            printf("[%s] 📡 Node%d transmitted -> %s\n", timeBuf, nodeId, buffer);
+            logToFile(nodeId, "DATA", buffer);
+
+            /* Broadcast to all nodes */
+            EnterCriticalSection(&cs);
+            for (int i = 0; i < clientCount; i++) {
+                sendto(
+                    serverSocket,
+                    buffer,
+                    strlen(buffer),
+                    0,
+                    (struct sockaddr*)&clients[i].addr,
+                    sizeof(clients[i].addr)
+                );
+            }
+            LeaveCriticalSection(&cs);
+        }
+
+        /* ---------- EOF ---------- */
+        else if (strcmp(buffer, "EOF") == 0) {
+            int nodeId = getNodeIdByAddr(&clientAddr);
+            if (nodeId == -1) nodeId = 0;
+            printf("[%s] 🔚 Node%d End of transmission\n", timeBuf, nodeId);
+            logToFile(nodeId, "EOF", "End of transmission");
+        }
+
+        /* ---------- UNKNOWN ---------- */
+        else {
+            int nodeId = getNodeIdByAddr(&clientAddr);
+            if (nodeId == -1) nodeId = 0;
+            printf("[%s] ⚠ Node%d Unknown: %s\n", timeBuf, nodeId, buffer);
+            logToFile(nodeId, "UNKNOWN", buffer);
         }
     }
 
     closesocket(serverSocket);
     WSACleanup();
+    DeleteCriticalSection(&cs);
     return 0;
 }
