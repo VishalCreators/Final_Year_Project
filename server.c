@@ -10,11 +10,14 @@
 #define SERVER_PORT 8888
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 10
+#define CLIENT_TIMEOUT 15   // seconds
 
 typedef struct {
     struct sockaddr_in addr;
     int registered;
     int nodeId;
+    time_t lastSeen;
+    int active;
 } Client;
 
 Client clients[MAX_CLIENTS];
@@ -28,40 +31,46 @@ void getTimestamp(char *timeBuf, int size) {
     strftime(timeBuf, size, "%Y-%m-%d %H:%M:%S", t);
 }
 
-/* ---------- LOG TO FILE (Structured) ---------- */
+/* ---------- LOG TO FILE ---------- */
 void logToFile(int nodeId, const char *eventType, const char *data) {
-    FILE *fp = fopen("server_log.txt", "a");  // structured file
+    FILE *fp = fopen("server_log.txt", "a");
     if (!fp) return;
 
     char timeBuf[64];
     getTimestamp(timeBuf, sizeof(timeBuf));
 
-    if (nodeId > 0)
-        fprintf(fp, "[%s] Node%d %s -> %s\n", timeBuf, nodeId, eventType, data);
-    else
-        fprintf(fp, "[%s] %s -> %s\n", timeBuf, eventType, data);
+    fprintf(fp, "[%s] Node%d %s -> %s\n",
+            timeBuf, nodeId, eventType, data);
 
     fclose(fp);
 }
 
-/* ---------- FIND NODE ID BY ADDR ---------- */
-int getNodeIdByAddr(struct sockaddr_in *addr) {
+/* ---------- FIND CLIENT ---------- */
+int findClientByAddr(struct sockaddr_in *addr) {
     for (int i = 0; i < clientCount; i++) {
         if (clients[i].registered &&
             clients[i].addr.sin_addr.s_addr == addr->sin_addr.s_addr &&
             clients[i].addr.sin_port == addr->sin_port) {
-            return clients[i].nodeId;
+            return i;
         }
     }
-    return -1; // unknown
+    return -1;
 }
 
-/* ---------- REGISTER CLIENT ---------- */
+/* ---------- REGISTER / RECONNECT ---------- */
 void registerClient(struct sockaddr_in *addr, int nodeId) {
     EnterCriticalSection(&cs);
 
     for (int i = 0; i < clientCount; i++) {
         if (clients[i].nodeId == nodeId) {
+            clients[i].addr = *addr;
+            clients[i].active = 1;
+            clients[i].registered = 1;
+            clients[i].lastSeen = time(NULL);
+
+            logToFile(nodeId, "RECONNECT", "Client reconnected");
+            printf("🟡 Node%d reconnected\n", nodeId);
+
             LeaveCriticalSection(&cs);
             return;
         }
@@ -71,10 +80,52 @@ void registerClient(struct sockaddr_in *addr, int nodeId) {
         clients[clientCount].addr = *addr;
         clients[clientCount].nodeId = nodeId;
         clients[clientCount].registered = 1;
+        clients[clientCount].active = 1;
+        clients[clientCount].lastSeen = time(NULL);
+
+        logToFile(nodeId, "REGISTER", "New client registered");
+        printf("🟢 Node%d registered\n", nodeId);
+
         clientCount++;
     }
 
     LeaveCriticalSection(&cs);
+}
+
+/* ---------- UPDATE LAST SEEN (SILENT) ---------- */
+void updateLastSeen(struct sockaddr_in *addr) {
+    EnterCriticalSection(&cs);
+    int idx = findClientByAddr(addr);
+    if (idx != -1) {
+        clients[idx].lastSeen = time(NULL);
+        clients[idx].active = 1;
+    }
+    LeaveCriticalSection(&cs);
+}
+
+/* ---------- MONITOR DISCONNECT ---------- */
+DWORD WINAPI monitorClients(LPVOID lpParam) {
+    while (1) {
+        Sleep(2000);
+        time_t now = time(NULL);
+
+        EnterCriticalSection(&cs);
+        for (int i = 0; i < clientCount; i++) {
+            if (clients[i].active &&
+                difftime(now, clients[i].lastSeen) > CLIENT_TIMEOUT) {
+
+                clients[i].active = 0;
+
+                logToFile(clients[i].nodeId,
+                          "DISCONNECT",
+                          "Client inactive timeout");
+
+                printf("🔴 Node%d disconnected\n", clients[i].nodeId);
+            }
+        }
+        LeaveCriticalSection(&cs);
+    }
+    return 0;
 }
 
 /* ================= MAIN ================= */
@@ -86,8 +137,8 @@ int main() {
     int addrLen = sizeof(clientAddr);
 
     InitializeCriticalSection(&cs);
-
     WSAStartup(MAKEWORD(2,2), &wsa);
+
     serverSocket = socket(AF_INET, SOCK_DGRAM, 0);
 
     serverAddr.sin_family = AF_INET;
@@ -96,38 +147,29 @@ int main() {
 
     bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
 
+    CreateThread(NULL, 0, monitorClients, NULL, 0, NULL);
+
     printf("✅ Server running on port %d\n", SERVER_PORT);
 
     while (1) {
-        int bytes = recvfrom(
-            serverSocket,
-            buffer,
-            BUFFER_SIZE - 1,
-            0,
-            (struct sockaddr*)&clientAddr,
-            &addrLen
-        );
+        int bytes = recvfrom(serverSocket, buffer, BUFFER_SIZE - 1, 0,
+                             (struct sockaddr*)&clientAddr, &addrLen);
 
-        if (bytes <= 0)
-            continue;
-
+        if (bytes <= 0) continue;
         buffer[bytes] = '\0';
 
-        char timeBuf[64];
-        getTimestamp(timeBuf, sizeof(timeBuf));
+        /* ---------- HEARTBEAT (SILENT) ---------- */
+        if (strncmp(buffer, "HEARTBEAT:", 10) == 0) {
+            updateLastSeen(&clientAddr);
+            continue;
+        }
 
-        /* ---------- NODE ID MESSAGE (Auto-register) ---------- */
+        /* ---------- NODE ---------- */
         if (strncmp(buffer, "NODE:", 5) == 0) {
-            int nodeId = 0;
+            int nodeId;
             sscanf(buffer, "NODE:%d", &nodeId);
-
-            int existingId = getNodeIdByAddr(&clientAddr);
-            if (existingId == -1 && nodeId > 0) {
-                registerClient(&clientAddr, nodeId);
-                printf("[%s] 🟢 Node %d auto-registered\n", timeBuf, nodeId);
-                logToFile(nodeId, "REGISTER", "Auto-registered via NODE message");
-            }
-            continue; // skip further processing for this message
+            registerClient(&clientAddr, nodeId);
+            continue;
         }
 
         /* ---------- REGISTER ---------- */
@@ -135,48 +177,18 @@ int main() {
             int nodeId;
             sscanf(buffer, "REGISTER:NODE:%d", &nodeId);
             registerClient(&clientAddr, nodeId);
-
-            printf("[%s] 🟢 Node %d registered\n", timeBuf, nodeId);
-            logToFile(nodeId, "REGISTER", "Node registered successfully");
+            continue;
         }
 
         /* ---------- DATA ---------- */
-        else if (strncmp(buffer, "DATA:", 5) == 0) {
-            int nodeId = getNodeIdByAddr(&clientAddr);
-            if (nodeId == -1) nodeId = 0; // fallback unknown
+        if (strncmp(buffer, "DATA:", 5) == 0) {
+            updateLastSeen(&clientAddr);
 
-            printf("[%s] 📡 Node%d transmitted -> %s\n", timeBuf, nodeId, buffer);
+            int idx = findClientByAddr(&clientAddr);
+            int nodeId = (idx != -1) ? clients[idx].nodeId : 0;
+
+            printf("📡 Node%d -> %s\n", nodeId, buffer);
             logToFile(nodeId, "DATA", buffer);
-
-            /* Broadcast to all nodes */
-            EnterCriticalSection(&cs);
-            for (int i = 0; i < clientCount; i++) {
-                sendto(
-                    serverSocket,
-                    buffer,
-                    strlen(buffer),
-                    0,
-                    (struct sockaddr*)&clients[i].addr,
-                    sizeof(clients[i].addr)
-                );
-            }
-            LeaveCriticalSection(&cs);
-        }
-
-        /* ---------- EOF ---------- */
-        else if (strcmp(buffer, "EOF") == 0) {
-            int nodeId = getNodeIdByAddr(&clientAddr);
-            if (nodeId == -1) nodeId = 0;
-            printf("[%s] 🔚 Node%d End of transmission\n", timeBuf, nodeId);
-            logToFile(nodeId, "EOF", "End of transmission");
-        }
-
-        /* ---------- UNKNOWN ---------- */
-        else {
-            int nodeId = getNodeIdByAddr(&clientAddr);
-            if (nodeId == -1) nodeId = 0;
-            printf("[%s] ⚠ Node%d Unknown: %s\n", timeBuf, nodeId, buffer);
-            logToFile(nodeId, "UNKNOWN", buffer);
         }
     }
 

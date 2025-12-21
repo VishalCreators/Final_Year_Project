@@ -10,17 +10,19 @@
 /* ---------------- CONFIG ---------------- */
 #define SERVER_PORT 8888
 #define BUF_SIZE 1024
-#define NODE_ID 1                 // 🔴 CHANGE THIS ONLY
+#define NODE_ID 1                 // CHANGE THIS ONLY
 #define COM_PORT "\\\\.\\COM9"
 
 /* -------- SEND CONTROL -------- */
 #define SEND_INTERVAL_MS (2 * 60 * 1000)   // 2 minutes
+#define HEARTBEAT_INTERVAL_MS 5000         // heartbeat every 5 sec
 #define TEMP_THRESHOLD  0.5                // °C
 #define HUM_THRESHOLD   2.0                // %
 
 /* ---------------------------------------- */
 HANDLE hSerial = INVALID_HANDLE_VALUE;
 DWORD lastSendTime = 0;
+DWORD lastHeartbeat = 0;
 float lastTemp = -1000;
 float lastHum  = -1000;
 
@@ -128,13 +130,23 @@ int main() {
         printf("✅ Arduino connected\n");
 
         while (1) {
+            DWORD now = GetTickCount();
+
+            /* ---------- HEARTBEAT (SILENT) ---------- */
+            if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+                sprintf(buffer, "HEARTBEAT:NODE:%d", NODE_ID);
+                sendto(sock, buffer, strlen(buffer), 0,
+                       (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+                lastHeartbeat = now;
+            }
+
             float temp, hum;
             int status = readSensor(&temp, &hum);
 
             if (status == 1) {
                 printf("📡 Read -> Temp: %.2f°C  Hum: %.2f%%\n", temp, hum);
 
-                // Store in local file
+                /* Store in shared file */
                 FILE *fp = fopen("shared_data.txt", "w");
                 if (fp) {
                     fprintf(fp, "TEMP=%.2f HUM=%.2f\n", temp, hum);
@@ -157,7 +169,7 @@ int main() {
 
                     lastTemp = temp;
                     lastHum  = hum;
-                    lastSendTime = GetTickCount();
+                    lastSendTime = now;
                 } else {
                     printf("⏸️ No significant change\n");
                 }
@@ -172,20 +184,29 @@ int main() {
         printf("Waiting to read shared file...\n");
 
         while (1) {
+            DWORD now = GetTickCount();
+
+            /* ---------- HEARTBEAT (SILENT) ---------- */
+            if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
+                sprintf(buffer, "HEARTBEAT:NODE:%d", NODE_ID);
+                sendto(sock, buffer, strlen(buffer), 0,
+                       (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+                lastHeartbeat = now;
+            }
+
             float temp = 0, hum = 0;
             int fileOK = 0;
 
-            // Read from shared file
             FILE *fp = fopen("shared_data.txt", "r");
             if (fp) {
-                if (fscanf(fp, "TEMP=%f HUM=%f", &temp, &hum) == 2) {
+                if (fscanf(fp, "TEMP=%f HUM=%f", &temp, &hum) == 2)
                     fileOK = 1;
-                }
                 fclose(fp);
             }
 
             if (fileOK) {
-                printf("📥 Read from file -> Temp: %.2f°C  Hum: %.2f%%\n", temp, hum);
+                printf("📥 Read from file -> Temp: %.2f°C  Hum: %.2f%%\n",
+                       temp, hum);
 
                 if (shouldSend(temp, hum)) {
                     printf("🚀 Forwarding to server\n");
@@ -203,13 +224,13 @@ int main() {
 
                     lastTemp = temp;
                     lastHum  = hum;
-                    lastSendTime = GetTickCount();
+                    lastSendTime = now;
                 } else {
                     printf("⏸️ Forward skipped\n");
                 }
             }
 
-            Sleep(5000);  // check file every 5 seconds
+            Sleep(5000);
         }
     }
 
