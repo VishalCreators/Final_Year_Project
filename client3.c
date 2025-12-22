@@ -4,20 +4,27 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <math.h>
+#include <time.h>
 
 #pragma comment(lib,"ws2_32.lib")
 
 /* ---------------- CONFIG ---------------- */
 #define SERVER_PORT 8888
 #define BUF_SIZE 1024
-#define NODE_ID 3                 // 🔴 CHANGE THIS ONLY
+#define NODE_ID 3                 // CHANGE THIS ONLY
 #define COM_PORT "\\\\.\\COM9"
 
 /* -------- SEND CONTROL -------- */
 #define SEND_INTERVAL_MS (2 * 60 * 1000)   // 2 minutes
-#define HEARTBEAT_INTERVAL_MS 5000         // 🔥 heartbeat every 5 sec
+#define HEARTBEAT_INTERVAL_MS 5000         // heartbeat every 5 sec
 #define TEMP_THRESHOLD  0.5                // °C
 #define HUM_THRESHOLD   2.0                // %
+
+/* -------- FAKE SENSOR RANGE -------- */
+#define SOIL_MIN  30
+#define SOIL_MAX  80
+#define WATER_MIN 20
+#define WATER_MAX 100
 
 /* ---------------------------------------- */
 HANDLE hSerial = INVALID_HANDLE_VALUE;
@@ -25,6 +32,11 @@ DWORD lastSendTime = 0;
 DWORD lastHeartbeat = 0;
 float lastTemp = -1000;
 float lastHum  = -1000;
+
+/* ---------- RANDOM RANGE ---------- */
+int randomInRange(int min, int max) {
+    return min + rand() % (max - min + 1);
+}
 
 /* ---------- OPEN ARDUINO ---------- */
 int openArduino() {
@@ -101,6 +113,8 @@ int main() {
     struct sockaddr_in serverAddr;
     char serverIP[50], buffer[BUF_SIZE];
 
+    srand((unsigned int)time(NULL));
+
     WSAStartup(MAKEWORD(2,2), &wsa);
     sock = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -132,7 +146,7 @@ int main() {
         while (1) {
             DWORD now = GetTickCount();
 
-            /* ---------- HEARTBEAT (SILENT) ---------- */
+            /* ---------- HEARTBEAT ---------- */
             if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
                 sprintf(buffer, "HEARTBEAT:NODE:%d", NODE_ID);
                 sendto(sock, buffer, strlen(buffer), 0,
@@ -146,21 +160,32 @@ int main() {
             if (status == 1) {
                 printf("📡 Read -> Temp: %.2f°C  Hum: %.2f%%\n", temp, hum);
 
-                /* Store in shared file */
-                FILE *fp = fopen("shared_data.txt", "w");
-                if (fp) {
-                    fprintf(fp, "TEMP=%.2f HUM=%.2f\n", temp, hum);
-                    fclose(fp);
-                }
-
                 if (shouldSend(temp, hum)) {
+
+                    int soil  = randomInRange(SOIL_MIN, SOIL_MAX);
+                    int water = randomInRange(WATER_MIN, WATER_MAX);
+
+                    printf("🌱 Soil: %d%%  💧 Water: %d%%\n", soil, water);
                     printf("🚀 Sending data to server\n");
+
+                    /* Store shared file */
+                    FILE *fp = fopen("shared_data.txt", "w");
+                    if (fp) {
+                        fprintf(fp,
+                            "TEMP=%.2f HUM=%.2f SOIL=%d WATER=%d\n",
+                            temp, hum, soil, water
+                        );
+                        fclose(fp);
+                    }
 
                     sprintf(buffer, "NODE:%d", NODE_ID);
                     sendto(sock, buffer, strlen(buffer), 0,
                            (struct sockaddr*)&serverAddr, sizeof(serverAddr));
 
-                    sprintf(buffer, "DATA:TEMP=%.2f HUM=%.2f", temp, hum);
+                    sprintf(buffer,
+                        "DATA:TEMP=%.2f HUM=%.2f SOIL=%d WATER=%d",
+                        temp, hum, soil, water
+                    );
                     sendto(sock, buffer, strlen(buffer), 0,
                            (struct sockaddr*)&serverAddr, sizeof(serverAddr));
 
@@ -175,18 +200,17 @@ int main() {
                 }
             }
 
-            Sleep(5000);   // read every 5 seconds
+            Sleep(5000);
         }
     }
 
-    /* ---------- OTHER CLIENTS (2,3,4...) ---------- */
+    /* ---------- OTHER CLIENTS ---------- */
     else {
         printf("Waiting to read shared file...\n");
 
         while (1) {
             DWORD now = GetTickCount();
 
-            /* ---------- HEARTBEAT (SILENT) ---------- */
             if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
                 sprintf(buffer, "HEARTBEAT:NODE:%d", NODE_ID);
                 sendto(sock, buffer, strlen(buffer), 0,
@@ -194,40 +218,40 @@ int main() {
                 lastHeartbeat = now;
             }
 
-            float temp = 0, hum = 0;
-            int fileOK = 0;
+            float temp, hum;
+            int soil, water;
 
             FILE *fp = fopen("shared_data.txt", "r");
             if (fp) {
-                if (fscanf(fp, "TEMP=%f HUM=%f", &temp, &hum) == 2)
-                    fileOK = 1;
-                fclose(fp);
-            }
+                if (fscanf(fp,
+                    "TEMP=%f HUM=%f SOIL=%d WATER=%d",
+                    &temp, &hum, &soil, &water) == 4) {
 
-            if (fileOK) {
-                printf("📥 Read from file -> Temp: %.2f°C  Hum: %.2f%%\n",
-                       temp, hum);
+                    printf("📥 File -> T:%.2f H:%.2f S:%d W:%d\n",
+                           temp, hum, soil, water);
 
-                if (shouldSend(temp, hum)) {
-                    printf("🚀 Forwarding to server\n");
+                    if (shouldSend(temp, hum)) {
 
-                    sprintf(buffer, "NODE:%d", NODE_ID);
-                    sendto(sock, buffer, strlen(buffer), 0,
-                           (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+                        sprintf(buffer, "NODE:%d", NODE_ID);
+                        sendto(sock, buffer, strlen(buffer), 0,
+                               (struct sockaddr*)&serverAddr, sizeof(serverAddr));
 
-                    sprintf(buffer, "DATA:TEMP=%.2f HUM=%.2f", temp, hum);
-                    sendto(sock, buffer, strlen(buffer), 0,
-                           (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+                        sprintf(buffer,
+                            "DATA:TEMP=%.2f HUM=%.2f SOIL=%d WATER=%d",
+                            temp, hum, soil, water
+                        );
+                        sendto(sock, buffer, strlen(buffer), 0,
+                               (struct sockaddr*)&serverAddr, sizeof(serverAddr));
 
-                    sendto(sock, "EOF", 3, 0,
-                           (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+                        sendto(sock, "EOF", 3, 0,
+                               (struct sockaddr*)&serverAddr, sizeof(serverAddr));
 
-                    lastTemp = temp;
-                    lastHum  = hum;
-                    lastSendTime = now;
-                } else {
-                    printf("⏸️ Forward skipped\n");
+                        lastTemp = temp;
+                        lastHum  = hum;
+                        lastSendTime = now;
+                    }
                 }
+                fclose(fp);
             }
 
             Sleep(5000);

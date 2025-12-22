@@ -92,7 +92,7 @@ void registerClient(struct sockaddr_in *addr, int nodeId) {
     LeaveCriticalSection(&cs);
 }
 
-/* ---------- UPDATE LAST SEEN (SILENT) ---------- */
+/* ---------- UPDATE LAST SEEN ---------- */
 void updateLastSeen(struct sockaddr_in *addr) {
     EnterCriticalSection(&cs);
     int idx = findClientByAddr(addr);
@@ -158,9 +158,17 @@ int main() {
         if (bytes <= 0) continue;
         buffer[bytes] = '\0';
 
-        /* ---------- HEARTBEAT (SILENT) ---------- */
+        /* ---------- HEARTBEAT ---------- */
         if (strncmp(buffer, "HEARTBEAT:", 10) == 0) {
             updateLastSeen(&clientAddr);
+            continue;
+        }
+
+        /* ---------- REGISTER ---------- */
+        if (strncmp(buffer, "REGISTER:", 9) == 0) {
+            int nodeId;
+            sscanf(buffer, "REGISTER:NODE:%d", &nodeId);
+            registerClient(&clientAddr, nodeId);
             continue;
         }
 
@@ -172,14 +180,6 @@ int main() {
             continue;
         }
 
-        /* ---------- REGISTER ---------- */
-        if (strncmp(buffer, "REGISTER", 8) == 0) {
-            int nodeId;
-            sscanf(buffer, "REGISTER:NODE:%d", &nodeId);
-            registerClient(&clientAddr, nodeId);
-            continue;
-        }
-
         /* ---------- DATA ---------- */
         if (strncmp(buffer, "DATA:", 5) == 0) {
             updateLastSeen(&clientAddr);
@@ -187,8 +187,26 @@ int main() {
             int idx = findClientByAddr(&clientAddr);
             int nodeId = (idx != -1) ? clients[idx].nodeId : 0;
 
-            printf("📡 Node%d -> %s\n", nodeId, buffer);
-            logToFile(nodeId, "DATA", buffer);
+            float temp, hum;
+            int soil, water;
+
+            if (sscanf(buffer,
+                "DATA:TEMP=%f HUM=%f SOIL=%d WATER=%d",
+                &temp, &hum, &soil, &water) == 4) {
+
+                char logBuf[128];
+                sprintf(logBuf,
+                        "TEMP=%.2f HUM=%.2f SOIL=%d WATER=%d",
+                        temp, hum, soil, water);
+
+                printf("📡 Node%d -> %s\n", nodeId, logBuf);
+                logToFile(nodeId, "DATA", logBuf);
+            }
+            else {
+                /* fallback */
+                printf("📡 Node%d -> %s\n", nodeId, buffer);
+                logToFile(nodeId, "DATA", buffer);
+            }
         }
     }
 
